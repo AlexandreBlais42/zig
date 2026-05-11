@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const bt = std.bittorrent;
 const Io = std.Io;
@@ -433,7 +434,7 @@ fn isQueryParamChar(c: u8) bool {
     };
 }
 
-fn peerWorker(allocator: Allocator, io: Io, torrent: *Torrent, peer_ptr: *?Peer) !void {
+fn peerWorker(allocator: Allocator, io: Io, torrent: *Torrent, peer_ptr: *?Peer) Io.Cancelable!void {
     defer {
         torrent.mutex.lockUncancelable(io);
         defer torrent.mutex.unlock(io);
@@ -442,17 +443,156 @@ fn peerWorker(allocator: Allocator, io: Io, torrent: *Torrent, peer_ptr: *?Peer)
 
     const peer = &peer_ptr.*.?;
 
-    peerWorkerInner(allocator, io, torrent, peer) catch |err| switch (err) {
+    const stream = peer.addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        std.log.err("unable to connect to peer: {t}", .{err});
+        return;
+    };
+
+    var read_buf: [0x2000]u8 = undefined;
+    var send_buf: [0x2000]u8 = undefined;
+
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &send_buf);
+
+    peerWorkerInner(allocator, io, torrent, peer, &reader, &writer) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
+        error.ProtocolError => {
+            return std.log.err("peer protocol error, terminating peer", .{});
+        },
+        error.ReadFailed => {
+            std.log.err("unable to read from peer: {t}", .{reader.err.?});
+        },
+        error.WriteFailed => {
+            std.log.err("unable to write to peer: {t}", .{writer.err.?});
+        },
+        error.EndOfStream => std.log.err("unexpected end of stream", .{}),
+        error.OutOfMemory => @panic("OOM"),
     };
 }
 
-fn peerWorkerInner(allocator: Allocator, io: Io, torrent: *Torrent, peer: *Peer) !void {
-    _ = allocator;
-    _ = torrent;
+fn peerWorkerInner(
+    allocator: Allocator,
+    io: Io,
+    torrent: *Torrent,
+    peer: *Peer,
+    reader: *Io.net.Stream.Reader,
+    writer: *Io.net.Stream.Writer,
+) !void {
+    // It's handshake o'clock
+
+    const mw: bt.protocol.MessageWriter = .{ .writer = &writer.interface };
+    try mw.writeHandshake(
+        // Signal extension protocol ([BEP 0010](https://www.bittorrent.org/beps/bep_0010.html))
+        &.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00 },
+        &torrent.info_hash,
+        &torrent.peer_id,
+    );
+    try writeExtHandshake(mw, allocator, .{ .your_ip = peer.addr });
+    try writer.interface.flush();
+
+    const peer_handshake_length = try reader.interface.takeByte();
+    if (peer_handshake_length != 19) return error.ProtocolError;
+    const peer_handshake_str = try reader.interface.take(19);
+    if (!std.mem.eql(u8, peer_handshake_str, "BitTorrent protocol")) return error.ProtocolError;
+    const peer_extension_bytes = try reader.interface.take(8);
+    if (peer_extension_bytes[5] & 0x10 == 0) return error.ProtocolError;
+    const peer_advertised_info_hash = try reader.interface.take(20);
+    if (!std.mem.eql(u8, &torrent.info_hash, peer_advertised_info_hash)) return error.ProtocolError;
+    const peer_advertised_id = try reader.interface.takeArray(20);
+    if (peer.maybe_id) |*peer_expected_id| {
+        if (!std.mem.eql(u8, peer_expected_id, peer_advertised_id)) return error.ProtocolError;
+    } else {
+        peer.maybe_id = peer_advertised_id.*;
+    }
+
+    std.log.info("shook hands with {f}", .{peer.addr});
+
+    // We negotiated the extension protocol, so we now expect the extension handshake
+
+    const peer_ext_handshake_length = try reader.interface.takeInt(u32, .big);
+    if (peer_ext_handshake_length < 9) return error.ProtocolError; // Shortest possible valid handshake: message ID (1) + ext message ID (1) + "d1:mdee".len (7) = 9
+
+    var limited_reader_buf: [8]u8 = undefined;
+    var limited_reader = reader.interface.limited(.limited64(peer_ext_handshake_length), &limited_reader_buf);
+
+    const peer_ext_handshake_message_id = try limited_reader.interface.takeByte();
+    if (peer_ext_handshake_message_id != 0x14) return error.ProtocolError; // This BitTorrent message is not an ext message.
+    const peer_ext_handshake_ext_message_id = try limited_reader.interface.takeByte();
+    if (peer_ext_handshake_ext_message_id != 0x00) return error.ProtocolError; // This ext message is not a handshake.
+
+    var ext_handshake_parse_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer ext_handshake_parse_arena.deinit();
+    const parsed_ext_handshake = bt.bencode.parseFromReaderLeaky(ext_handshake_parse_arena.allocator(), &limited_reader.interface) catch |err| switch (err) {
+        error.SyntaxError => return error.ProtocolError,
+        else => |e| return e,
+    };
+
+    if (parsed_ext_handshake != .dictionary) return error.ProtocolError;
+    const peer_m = parsed_ext_handshake.dictionary.get("m") orelse return error.ProtocolError;
+    if (peer_m != .dictionary) return error.ProtocolError;
+    const peer_m_ut_metadata = peer_m.dictionary.get("ut_metadata") orelse return error.ProtocolError;
+    if (peer_m_ut_metadata != .integer) return error.ProtocolError;
+    const ext_metadata_id = std.fmt.parseUnsigned(u8, peer_m_ut_metadata.integer, 10) catch return error.ProtocolError;
+
+    const peer_metadata_size = parsed_ext_handshake.dictionary.get("metadata_size") orelse return error.ProtocolError;
+    if (peer_metadata_size != .integer) return error.ProtocolError;
+    const metadata_size = std.fmt.parseUnsigned(usize, peer_metadata_size.integer, 10) catch return error.ProtocolError;
+    if (metadata_size == 0) return error.ProtocolError;
+
+    std.log.info("metadata size is {d} ({0Bi:.2})", .{metadata_size});
+
+    const maybe_peer_v = parsed_ext_handshake.dictionary.get("v");
+    if (maybe_peer_v) |peer_v| {
+        if (peer_v != .string) return error.ProtocolError;
+        std.log.info("peer {f} is running {f}", .{ peer.addr, std.zig.fmtString(peer_v.string) });
+    }
+
+    _ = ext_metadata_id;
 
     while (true) {
         std.log.debug("{f} {?f}: woo im doing peer stuff", .{ peer.addr, if (peer.maybe_id) |*id| std.zig.fmtString(id) else null });
         try io.sleep(.fromSeconds(5), .awake);
     }
+}
+
+const ExtHandshakeOptions = struct {
+    your_ip: ?Io.net.IpAddress = null,
+};
+
+fn writeExtHandshake(mw: bt.protocol.MessageWriter, gpa: Allocator, options: ExtHandshakeOptions) (Allocator.Error || Io.Writer.Error)!void {
+    var ext_allocating: Io.Writer.Allocating = try .initCapacity(gpa, 128);
+    defer ext_allocating.deinit();
+    const ext_str = make: {
+        const ext_str: bt.bencode.Stringify = .{ .writer = &ext_allocating.writer };
+        try ext_str.beginDictionary();
+
+        try ext_str.writeString("m");
+        try ext_str.beginDictionary();
+        // We hardcode the ut_metadata ID to 1 to not worry about storing it
+        try ext_str.writeString("ut_metadata");
+        try ext_str.writeInteger(1);
+        try ext_str.endContainer();
+
+        try ext_str.writeString("reqq");
+        try ext_str.writeInteger(64);
+
+        try ext_str.writeString("v");
+        try ext_str.writeString("Zig/" ++ builtin.zig_version_string);
+
+        if (options.your_ip) |your_ip| {
+            try ext_str.writeString("yourip");
+            switch (your_ip) {
+                inline else => |ip| {
+                    try ext_str.beginString(ip.bytes.len);
+                    try ext_allocating.writer.writeAll(&ip.bytes);
+                },
+            }
+        }
+
+        try ext_str.endContainer();
+        break :make ext_allocating.written();
+    };
+
+    try mw.writeExtendedHeader(0x00, @as(u32, @intCast(ext_str.len)));
+    try mw.writer.writeAll(ext_str);
 }
