@@ -46,6 +46,7 @@ dependencies: std.StringArrayHashMapUnmanaged(Dependency),
 dependencies_node: Ast.Node.OptionalIndex,
 paths: std.StringArrayHashMapUnmanaged(void),
 minimum_zig_version: ?std.SemanticVersion,
+private: bool,
 
 errors: []ErrorMessage,
 arena_state: std.heap.ArenaAllocator.State,
@@ -77,6 +78,7 @@ pub fn parse(gpa: Allocator, ast: *const Ast, rng: std.Random, options: ParseOpt
         .paths = .empty,
         .allow_missing_paths_field = options.allow_missing_paths_field,
         .minimum_zig_version = null,
+        .private = false,
         .buf = .empty,
     };
     defer p.buf.deinit(gpa);
@@ -98,6 +100,7 @@ pub fn parse(gpa: Allocator, ast: *const Ast, rng: std.Random, options: ParseOpt
         .dependencies_node = p.dependencies_node,
         .paths = try p.paths.clone(p.arena),
         .minimum_zig_version = p.minimum_zig_version,
+        .private = p.private,
         .errors = try p.arena.dupe(ErrorMessage, p.errors.items),
         .arena_state = arena_instance.state,
     };
@@ -149,6 +152,7 @@ const Parse = struct {
     paths: std.StringArrayHashMapUnmanaged(void),
     allow_missing_paths_field: bool,
     minimum_zig_version: ?std.SemanticVersion,
+    private: bool,
 
     const InnerError = error{ ParseFailure, OutOfMemory };
 
@@ -200,6 +204,8 @@ const Parse = struct {
                     try appendError(p, ast.nodeMainToken(field_init), "unable to parse semantic version: {s}", .{@errorName(err)});
                     break :v null;
                 };
+            } else if (mem.eql(u8, field_name, "private")) {
+                p.private = try parseBool(p, field_init);
             } else {
                 // Ignore unknown fields so that we can add fields in future zig
                 // versions without breaking older zig versions.
