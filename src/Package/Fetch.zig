@@ -501,7 +501,7 @@ pub const Location = union(enum) {
     path_or_url: []const u8,
 
     pub const Remote = struct {
-        url: []const u8,
+        uri_path: []const u8,
         /// If this is null it means the user omitted the hash field from a dependency.
         /// It will be an error but the logic should still fetch and print the discovered hash.
         hash: ?Package.Hash,
@@ -676,7 +676,7 @@ pub fn run(f: *Fetch) RunError!void {
     }
 
     // Fetch and unpack the remote into a temporary directory.
-    const uri = std.Uri.parse(remote.url) catch |err| return f.fail(
+    const uri = std.Uri.parse(remote.uri_path) catch |err| return f.fail(
         f.location_tok,
         try eb.printString("invalid URI: {t}", .{err}),
     );
@@ -947,9 +947,9 @@ fn queueJobsForDeps(f: *Fetch) RunError!void {
             var promoted_existing_to_eager = false;
             const new_fetch = &new_fetches[new_fetch_index];
             const location: Location = switch (dep.location) {
-                .url => |url| .{
+                .url, .magnet => |uri| .{
                     .remote = .{
-                        .url = url,
+                        .uri_path = uri,
                         .hash = h: {
                             const h = dep.hash orelse break :h null;
                             const pkg_hash: Package.Hash = .fromSlice(h);
@@ -1085,6 +1085,7 @@ fn fail(f: *Fetch, msg_tok: std.zig.Ast.TokenIndex, msg_str: u32) RunError {
 const Resource = union(enum) {
     file: Io.File.Reader,
     http_request: HttpRequest,
+    torrent: Torrent,
     git: Git,
     dir: Io.Dir,
 
@@ -1102,10 +1103,15 @@ const Resource = union(enum) {
         decompress_buffer: []u8,
     };
 
+    const Torrent = struct {
+        // TODO:
+    };
+
     fn deinit(resource: *Resource, io: Io) void {
         switch (resource.*) {
             .file => |*file_reader| file_reader.file.close(io),
             .http_request => |*http_request| http_request.request.deinit(),
+            .torrent => {},
             .git => |*git_resource| {
                 git_resource.fetch_stream.deinit();
             },
@@ -1122,6 +1128,7 @@ const Resource = union(enum) {
                 &http_request.decompress,
                 http_request.decompress_buffer,
             ),
+            .torrent => @panic("Not implemented yet"),
             .git => |*g| return &g.fetch_stream.reader,
             .dir => unreachable,
         };
@@ -1321,6 +1328,11 @@ fn initResource(f: *Fetch, uri: std.Uri, resource: *Resource, reader_buffer: []u
         return;
     }
 
+    if (ascii.eqlIgnoreCase(uri.scheme, "magnet")) {
+        resource.* = .{ .torrent = .{} };
+        @panic("Not implemented yet");
+    }
+
     return f.fail(f.location_tok, try eb.printString("unsupported URL scheme: {s}", .{uri.scheme}));
 }
 
@@ -1394,6 +1406,10 @@ fn unpackResource(
             break :ft FileType.fromPath(uri_path) orelse {
                 return f.fail(f.location_tok, try eb.printString("unknown file type: '{s}'", .{uri_path}));
             };
+        },
+
+        .torrent => {
+            @panic("Not implemented yet");
         },
 
         .git => .git_pack,
@@ -2036,7 +2052,7 @@ pub fn depDigest(pkg_root: Cache.Path, cache_root: Cache.Directory, dep: Manifes
     if (dep.hash) |h| return .fromSlice(h);
 
     switch (dep.location) {
-        .url => return null,
+        .url, .magnet => return null,
         .path => |rel_path| {
             var buf: [fs.max_path_bytes]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&buf);

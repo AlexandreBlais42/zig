@@ -29,6 +29,7 @@ pub const Dependency = struct {
     pub const Location = union(enum) {
         url: []const u8,
         path: []const u8,
+        magnet: []const u8,
     };
 };
 
@@ -290,7 +291,7 @@ const Parse = struct {
             // that is desirable on a per-field basis.
             if (mem.eql(u8, field_name, "url")) {
                 if (has_location) {
-                    return fail(p, ast.nodeMainToken(field_init), "dependency should specify only one of 'url' and 'path' fields.", .{});
+                    return fail(p, ast.nodeMainToken(field_init), "dependency should specify only one of 'url', 'path' and 'magnet' fields.", .{});
                 }
                 dep.location = .{
                     .url = parseString(p, field_init) catch |err| switch (err) {
@@ -301,9 +302,22 @@ const Parse = struct {
                 has_location = true;
                 dep.location_tok = ast.nodeMainToken(field_init);
                 dep.location_node = field_init;
+            } else if (mem.eql(u8, field_name, "magnet_link")) {
+                if (has_location) {
+                    return fail(p, ast.nodeMainToken(field_init), "dependency should specify only one of 'url', 'path' and 'magnet' fields.", .{});
+                }
+                dep.location = .{
+                    .magnet = parseString(p, field_init) catch |err| switch (err) {
+                        error.ParseFailure => continue,
+                        else => |e| return e,
+                    },
+                };
+                has_location = true;
+                dep.location_tok = ast.nodeMainToken(field_init);
+                dep.location_node = field_init;
             } else if (mem.eql(u8, field_name, "path")) {
                 if (has_location) {
-                    return fail(p, ast.nodeMainToken(field_init), "dependency should specify only one of 'url' and 'path' fields.", .{});
+                    return fail(p, ast.nodeMainToken(field_init), "dependency should specify only one of 'url', 'path' and 'magnet' fields.", .{});
                 }
                 dep.location = .{
                     .path = parseString(p, field_init) catch |err| switch (err) {
