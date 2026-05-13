@@ -7302,7 +7302,7 @@ fn cmdFetch(
     if (manifest.dependencies.get(name)) |dep| {
         if (dep.hash) |h| {
             switch (dep.location) {
-                .url, .magnet => |u| {
+                .url => |u| {
                     if (mem.eql(u8, h, package_hash_slice) and mem.eql(u8, u, saved_path_or_url)) {
                         std.log.info("existing dependency named '{s}' is up-to-date", .{name});
                         process.exit(0);

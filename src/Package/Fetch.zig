@@ -501,7 +501,7 @@ pub const Location = union(enum) {
     path_or_url: []const u8,
 
     pub const Remote = struct {
-        uri_path: []const u8,
+        url: []const u8,
         /// If this is null it means the user omitted the hash field from a dependency.
         /// It will be an error but the logic should still fetch and print the discovered hash.
         hash: ?Package.Hash,
@@ -676,7 +676,7 @@ pub fn run(f: *Fetch) RunError!void {
     }
 
     // Fetch and unpack the remote into a temporary directory.
-    const uri = std.Uri.parse(remote.uri_path) catch |err| return f.fail(
+    const uri = std.Uri.parse(remote.url) catch |err| return f.fail(
         f.location_tok,
         try eb.printString("invalid URI: {t}", .{err}),
     );
@@ -947,9 +947,9 @@ fn queueJobsForDeps(f: *Fetch) RunError!void {
             var promoted_existing_to_eager = false;
             const new_fetch = &new_fetches[new_fetch_index];
             const location: Location = switch (dep.location) {
-                .url, .magnet => |uri| .{
+                .url => |url| .{
                     .remote = .{
-                        .uri_path = uri,
+                        .url = url,
                         .hash = h: {
                             const h = dep.hash orelse break :h null;
                             const pkg_hash: Package.Hash = .fromSlice(h);
@@ -2052,7 +2052,7 @@ pub fn depDigest(pkg_root: Cache.Path, cache_root: Cache.Directory, dep: Manifes
     if (dep.hash) |h| return .fromSlice(h);
 
     switch (dep.location) {
-        .url, .magnet => return null,
+        .url => return null,
         .path => |rel_path| {
             var buf: [fs.max_path_bytes]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&buf);
